@@ -3,7 +3,10 @@ LLM Security Guard - mini project applying CLLMSP concepts
 Modules covered: 2 (OWASP LLM01/02/04/08), 3 (Guardrails), 5 (PII redaction),
                  7 (Circuit Breaker + HITL), 8 (token-aware rate limiting)
 """
-import re, time, html
+import re, time, html, base64, logging, unicodedata
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [SECURITY] %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("llm_guard")
 
 # ---------- Module 3 / LLM01: input guardrail (rule-based first layer) ----------
 INJECTION_PATTERNS = [
@@ -14,12 +17,42 @@ INJECTION_PATTERNS = [
     r"developer mode|do anything now",
 ]
 
-def input_guardrail(text):
+ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
+
+def normalize(text):
+    """Defeat token smuggling (Module 3.3): NFKC folds homoglyph/fullwidth chars, strip zero-width chars."""
+    return unicodedata.normalize("NFKC", text).translate(ZERO_WIDTH)
+
+def decode_base64_chunks(text):
+    """Find Base64 blobs and decode them so hidden instructions get scanned too."""
+    out = []
+    for m in re.findall(r"[A-Za-z0-9+/]{16,}={0,2}", text):
+        try:
+            out.append(base64.b64decode(m, validate=True).decode("utf-8"))
+        except Exception:
+            pass
+    return out
+
+def _match(text):
     for p in INJECTION_PATTERNS:
         if re.search(p, text, re.I):
-            return False, f"prompt-injection pattern matched: /{p[:35]}.../"
+            return p
+    return None
+
+def input_guardrail(text):
     if len(text) > 4000:
+        log.warning("BLOCK input too long (LLM04)")
         return False, "input too long (LLM04 Model DoS)"
+    clean = normalize(text)
+    hit = _match(clean)
+    if hit:
+        log.warning("BLOCK prompt injection: %s", hit[:30])
+        return False, f"prompt-injection pattern matched: /{hit[:35]}.../"
+    for decoded in decode_base64_chunks(clean):
+        hit = _match(normalize(decoded))
+        if hit:
+            log.warning("BLOCK base64-smuggled injection")
+            return False, "base64-encoded injection detected"
     return True, "clean"
 
 # ---------- Module 5: PII redaction before sending to any LLM ----------
@@ -40,6 +73,7 @@ def redact(text):
 # ---------- Module 2 / LLM02: output handling ----------
 def output_guardrail(text, system_prompt_marker="SECRET-SYS"):
     if system_prompt_marker in text:
+        log.warning("BLOCK system prompt leak (LLM06)")
         return None, "blocked: system prompt leak (LLM06)"
     return html.escape(text), "escaped for HTML (anti-XSS)"
 
@@ -68,5 +102,6 @@ class CircuitBreaker:
         if self.calls > self.max_calls:
             raise AgentHalted(f"tool-call limit exceeded ({self.max_calls})")
         if tool in SENSITIVE_TOOLS and not human_approved:
+            log.warning("HALT %s needs HITL", tool)
             raise AgentHalted(f"'{tool}' requires human approval (HITL)")
         return True
